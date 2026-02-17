@@ -1,0 +1,208 @@
+<!doctype html>
+<!--
+  index.html - KMZ → Excel (MAPS.me pins)
+  - Client-side web app that extracts placemarks from a MAPS.me .kmz file
+    (KMZ is a zipped KML). It shows a preview and lets the user export
+    the extracted pins to an Excel (.xlsx) file.
+  - Libraries used: JSZip (unzip KMZ) and SheetJS / XLSX (create .xlsx)
+  - Usage: open this file in a browser, choose a .kmz file, then click
+    "Export to Excel" after the preview appears.
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>KMZ → Excel (MAPS.me pins)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    /* Basic page styles */
+    body{font-family:Segoe UI,Arial,Helvetica,sans-serif;margin:20px}
+    .card{max-width:760px;padding:18px;border:1px solid #ddd;border-radius:8px}
+    .card.dragover{border-color:#3b82f6;background:#f6fbff}
+    input[type=file]{display:block}
+    #status{margin-top:10px;color:#333}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{border:1px solid #eee;padding:6px;text-align:left}
+    .small{font-size:0.9em;color:#666}
+  </style>
+</head>
+<body>
+  <div class="card" id="dropZone">
+    <h2>KMZ → Excel (MAPS.me pins)</h2>
+    <p class="small">Upload a MAPS.me `.kmz` file. This page extracts placemarks and prepares an `.xlsx` workbook.</p>
+    <!-- Instruction text for drag-and-drop / chooser -->
+    <div id="dropText" class="small" style="margin-bottom:8px">Drag &amp; drop KMZ here or click Choose KMZ file</div>
+    <!-- File input: select a .kmz file (zipped KML). -->
+      <!-- Hidden native file input; triggered by the visible Choose button below -->
+      <input id="file" type="file" accept=".kmz" style="display:none" />
+      <!-- Visible chooser button (prevents accidental clicks on a wide native input) -->
+      <button id="chooseBtn" style="margin-right:8px">Choose KMZ file</button>
+    <!-- Export button is enabled after parsing; it triggers the download. -->
+    <button id="exportBtn" disabled style="margin-top:10px">Export to Excel</button>
+    <div id="status"></div>
+    <div id="preview"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <script>
+  /*
+    DOM references
+    - `fileInput`: hidden native <input type="file"> used to open the file dialog
+    - `chooseBtn`: visible button the user clicks; forwards clicks to `fileInput`
+    - `dropZone`: the card element which also acts as a drag-and-drop target
+    - `dropText`: small instruction text shown above the controls
+    - `status`: one-line status for progress/errors
+    - `preview`: HTML preview table for first 20 placemarks
+  */
+  const fileInput = document.getElementById('file');
+  const status = document.getElementById('status');
+  const preview = document.getElementById('preview');
+  // The visible button that triggers the hidden file input
+  const chooseBtn = document.getElementById('chooseBtn');
+
+  /*
+    Clicking the visible chooser should behave like clicking the native file
+    input. We keep the native input hidden to avoid accidental dialog opens
+    when the user clicks near a wide input area.
+  */
+  chooseBtn.addEventListener('click', () => fileInput.click());
+
+  /*
+    Drag-and-drop UI helpers
+    - `dropText` is updated to give immediate feedback while dragging
+    - `dropZone` receives the dropped file and forwards it to processing
+    Note: `dragover` must call `preventDefault()` to allow dropping.
+  */
+  const dropText = document.getElementById('dropText');
+  const dropTextDefault = dropText ? dropText.textContent : '';
+  const dropZone = document.getElementById('dropZone');
+  dropZone.addEventListener('dragover', (ev) => {
+    ev.preventDefault();
+    dropZone.classList.add('dragover');
+    if (dropText) dropText.textContent = 'Release to drop KMZ file';
+  });
+  dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('dragover');
+    if (dropText) dropText.textContent = dropTextDefault;
+  });
+  dropZone.addEventListener('drop', (ev) => {
+    ev.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (dropText) dropText.textContent = dropTextDefault;
+    const files = ev.dataTransfer && ev.dataTransfer.files;
+    if (files && files.length) {
+      const f = files[0];
+      if (f && chooseBtn) chooseBtn.textContent = f.name;
+      processKMZFile(f);
+    }
+  });
+
+  // Helper to update status text shown to the user
+  function setStatus(msg){ status.textContent = msg; }
+
+  // Handle file selection by forwarding to the shared KMZ processor
+  fileInput.addEventListener('change', (e) => {
+    const f = e.target.files[0];
+    if (f && chooseBtn) chooseBtn.textContent = f.name;
+    if (f) processKMZFile(f);
+  });
+
+  // Shared KMZ processor: reads KMZ, parses KML, extracts placemarks, shows preview
+  async function processKMZFile(f) {
+    setStatus(''); preview.innerHTML = '';
+    try {
+      setStatus('Reading KMZ...');
+      const arrayBuffer = await f.arrayBuffer();
+      const zip = await JSZip.loadAsync(arrayBuffer);
+
+      // Find first .kml file inside the KMZ (typical layout)
+      const kmlName = Object.keys(zip.files).find(n => n.toLowerCase().endsWith('.kml'));
+      if (!kmlName) { setStatus('No .kml found inside KMZ.'); return; }
+
+      // Parse KML XML
+      setStatus('Parsing KML...');
+      const kmlText = await zip.file(kmlName).async('string');
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(kmlText, 'application/xml');
+
+      // Extract Placemark elements and map them to simple JS objects
+      const placemarks = Array.from(xml.getElementsByTagName('Placemark'));
+      const rows = placemarks.map(pm => {
+        const getText = (tag) => {
+          const el = pm.getElementsByTagName(tag)[0];
+          return el && el.textContent ? el.textContent.trim() : '';
+        };
+        const name = getText('name');
+        const description = getText('description');
+
+        // Coordinates extraction: prefer Point -> coordinates, otherwise first coordinates found
+        let coordsText = '';
+        const point = pm.getElementsByTagName('Point')[0];
+        if (point) {
+          const coords = point.getElementsByTagName('coordinates')[0];
+          if (coords) coordsText = coords.textContent.trim();
+        }
+        if (!coordsText) {
+          const coords = pm.getElementsByTagName('coordinates')[0];
+          if (coords) coordsText = coords.textContent.trim();
+        }
+
+        // Split lon,lat,alt
+        let longitude='', latitude='', altitude='';
+        if (coordsText) {
+          const first = coordsText.split(/\s+/)[0].trim();
+          const parts = first.split(',');
+          longitude = parts[0] || '';
+          latitude = parts[1] || '';
+          altitude = parts[2] || '';
+        }
+        // include a space after comma in coordinates
+        const coordinates = (latitude || longitude) ? `${latitude}, ${longitude}` : '';
+        return { name, coordinates, latitude, longitude, altitude, description };
+      }).filter(r => r.name || r.latitude || r.longitude || r.description);
+
+      if (rows.length === 0) { setStatus('No placemarks found.'); return; }
+
+      // Build preview
+      setStatus('Previewing first 20 entries...');
+      const previewRows = rows.slice(0,20);
+      let html = '<table><thead><tr><th>Name</th><th>Coordinates</th><th>Latitude</th><th>Longitude</th><th>Altitude</th><th>Description</th></tr></thead><tbody>';
+      for (const r of previewRows){
+        html += `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.coordinates)}</td><td>${escapeHtml(r.latitude)}</td><td>${escapeHtml(r.longitude)}</td><td>${escapeHtml(r.altitude)}</td><td>${escapeHtml(r.description)}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      preview.innerHTML = html;
+
+      // Enable export
+      window._kmzRows = rows;
+      const exportBtn = document.getElementById('exportBtn');
+      exportBtn.disabled = false;
+      exportBtn.onclick = () => {
+        try {
+          setStatus('Generating Excel...');
+          const ws = XLSX.utils.json_to_sheet(window._kmzRows);
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, 'pins');
+          const outName = (f.name.replace(/\.kmz$/i,'') || 'pins') + '.xlsx';
+          XLSX.writeFile(wb, outName);
+          setStatus('Done — Excel download started.');
+        } catch (err) {
+          console.error(err);
+          setStatus('Export error: ' + (err && err.message ? err.message : err));
+        }
+      };
+    } catch (err) {
+      console.error(err);
+      setStatus('Error: ' + (err && err.message ? err.message : err));
+    }
+  }
+
+  // Small helper used to escape HTML shown in the preview table
+  function escapeHtml(s){
+    if (!s) return '';
+    return s.replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"})[ch]);
+  }
+  </script>
+</body>
+</html>
